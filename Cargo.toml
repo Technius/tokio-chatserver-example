@@ -1,0 +1,9 @@
+[package]
+name = "tokio-chatserver-example"
+version = "0.1.0"
+authors = ["Bryan Tan <techniux@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+tokio = "0.1"
+futures = "0.1"
