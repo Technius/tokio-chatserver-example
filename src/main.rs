@@ -1,7 +1,7 @@
 use futures::{Future, Stream, Sink, future::Loop, sync::mpsc::UnboundedSender};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
+use std::sync::{Arc, RwLock, atomic::{AtomicU64, Ordering}};
+use std::collections::{HashMap, HashSet};
 
 fn main() {
     let addr = "127.0.0.1:8080".parse::<SocketAddr>().unwrap();
@@ -9,9 +9,9 @@ fn main() {
     let mut runtime = tokio::runtime::Runtime::new()
         .expect("Could not start tokio runtime");
 
-    let clients = Arc::new(Mutex::new(Vec::<UnboundedSender<Message>>::new()));
-    let clients_clone = clients.clone();
-    let (control_tx, control_rx) = futures::sync::mpsc::unbounded::<Message>();
+    let server_ctx = Arc::new(ServerContext::new());
+    let server_ctx_clone = server_ctx.clone();
+    let (control_tx, control_rx) = futures::sync::mpsc::unbounded::<(ClientId, Message)>();
     let keep_alive = control_tx.clone();
 
     // Handle incoming connections
@@ -20,10 +20,7 @@ fn main() {
         .for_each(move |stream| {
             println!("Incoming connection");
             let (global_send, global_recv) = futures::sync::mpsc::unbounded::<Message>();
-            {
-                let mut senders = clients_clone.lock().unwrap();
-                senders.push(global_send);
-            }
+            let client_id = server_ctx_clone.add_client(global_send);
 
             let codec = tokio::codec::LinesCodec::new();
             let (output_frame, input_frame) = tokio::codec::Framed::new(stream, codec).split();
@@ -57,13 +54,23 @@ fn main() {
             // 1. The client closes its connection.
             // 2. The server closes the connection.
             let control_tx = control_tx.clone();
-            let final_fut = client_handle(message_stream, client_out_sender, control_tx.clone())
+            let (control_fwd_send, control_fwd_recv) = futures::sync::mpsc::unbounded::<Message>();
+            let fwd_fut = control_fwd_recv.map(move |msg| (client_id.clone(), msg))
+                .map_err::<futures::sync::mpsc::SendError<_>, _>(|_| unreachable!())
+                .forward(control_tx.clone());
+            let server_ctx_clone = server_ctx_clone.clone();
+            let final_fut = client_handle(message_stream, client_out_sender, control_fwd_send)
                 .select2(input_fut)
                 .select2(output_fut)
+                .select2(fwd_fut)
                 .inspect(move |_| {
                     println!("Connection terminated.");
-                    control_tx.clone().unbounded_send(
-                        Message::UserLoggedOut { name: "<some user (TODO)>".to_owned() }).unwrap();
+                    let name_opt = server_ctx_clone.get_name(&client_id);
+                    server_ctx_clone.terminate_client(&client_id);
+                    if let Some(name) = name_opt {
+                        let msg = (client_id, Message::UserLoggedOut { name: name.to_owned() });
+                        control_tx.clone().unbounded_send(msg).unwrap();
+                    }
                 })
                 .map(|_| ())
                 .map_err(|_| ());
@@ -74,9 +81,14 @@ fn main() {
         .map(|_| ());
 
     // Main message dispatcher; dispatches server-wide messages to clients
-    let main_channel_fut = control_rx.for_each(move |msg| {
-        let mut senders = clients.lock().unwrap();
-        senders.retain(move |s| {
+    let main_channel_fut = control_rx.for_each(move |(client_id, msg)| {
+        match &msg {
+            Message::UserLoggedIn { name } => {
+                server_ctx.set_name(&client_id, name.clone());
+            },
+            _ => ()
+        }
+        server_ctx.clients.write().unwrap().retain(move |_, s| {
             if let Ok(_) = s.unbounded_send(msg.clone()) {
                 true
             } else {
@@ -102,6 +114,57 @@ fn main() {
     shutdown_tx.send(()).unwrap();
 
     runtime.shutdown_on_idle().wait().unwrap();
+}
+
+type ClientId = u64;
+type RoomId = u64;
+
+#[derive(Debug)]
+struct ServerContext {
+    pub clients: Arc<RwLock<HashMap<ClientId, UnboundedSender<Message>>>>,
+    pub sessions: Arc<RwLock<HashMap<ClientId, String>>>,
+    pub rooms: Arc<RwLock<HashMap<RoomId, HashSet<ClientId>>>>,
+    pub next_id: AtomicU64,
+}
+
+impl ServerContext {
+    pub fn new() -> Self {
+        ServerContext {
+            clients: Arc::new(RwLock::new(HashMap::new())),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            rooms: Arc::new(RwLock::new(HashMap::new())),
+            next_id: AtomicU64::new(0),
+        }
+    }
+
+    /// Initializes the client in this ServerContext.
+    /// This will lock (write) the clients field.
+    pub fn add_client(&self, sender: UnboundedSender<Message>) -> ClientId {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.clients.write().unwrap().insert(id, sender);
+        id
+    }
+
+    /// Removes the client in this ServerContext.
+    /// This will lock (write) every field.
+    pub fn terminate_client(&self, id: &ClientId) {
+        self.clients.write().unwrap().remove(id);
+        self.sessions.write().unwrap().remove(id);
+        self.rooms.write().unwrap().entry(*id)
+            .and_modify(|clients| { clients.remove(id); () });
+    }
+
+    /// Sets the name of the given client.
+    /// This will lock (write) the sessions field.
+    pub fn set_name(&self, id: &ClientId, name: String) {
+        self.sessions.write().unwrap().insert(*id, name);
+    }
+
+    /// Returns the name of the given client.
+    /// This will lock (read) the sessions field.
+    pub fn get_name(&self, id: &ClientId) -> Option<String> {
+        self.sessions.read().unwrap().get(id).map(String::clone)
+    }
 }
 
 #[derive(Debug, Clone)]
