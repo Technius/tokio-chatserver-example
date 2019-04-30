@@ -86,6 +86,34 @@ fn main() {
             Message::UserLoggedIn { name } => {
                 server_ctx.set_name(&client_id, name.clone());
             },
+            Message::UserCommand { command, args } => {
+                if command == "msg" {
+                    if let Some(sender_name) = server_ctx.get_name(&client_id) {
+                        let sender_opt = args.get(0)
+                            .and_then(|n| {
+                                let id = server_ctx.find_by_name(n)?;
+                                let sender = server_ctx.get_sender(&id)?;
+                                Some((n.clone(), sender))
+                            });
+                        if let Some((recipient, recip_sender)) = sender_opt {
+                            let msg = args[1..].join(" ");
+                            recip_sender.unbounded_send(Message::PrivateMessage {
+                                party: sender_name.clone(),
+                                message: msg.clone(),
+                                is_to: true
+                            }).unwrap();
+                            if let Some(sender) = server_ctx.get_sender(&client_id) {
+                                sender.unbounded_send(Message::PrivateMessage {
+                                    party: sender_name,
+                                    message: msg,
+                                    is_to: false
+                                }).unwrap();
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            },
             _ => ()
         }
         server_ctx.clients.write().unwrap().retain(move |_, s| {
@@ -165,6 +193,25 @@ impl ServerContext {
     pub fn get_name(&self, id: &ClientId) -> Option<String> {
         self.sessions.read().unwrap().get(id).map(String::clone)
     }
+
+    /// Returns the id of the client with the given name.
+    /// This will lock (read) the sessions field.
+    pub fn find_by_name(&self, name: &str) -> Option<ClientId> {
+        self.sessions.read().unwrap()
+            .iter()
+            .filter_map(|(id, n)| {
+                if n == name {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .next()
+    }
+
+    pub fn get_sender(&self, id: &ClientId) -> Option<UnboundedSender<Message>> {
+        self.clients.read().unwrap().get(id).map(|s| s.clone())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -178,7 +225,9 @@ enum Message {
     ClientInput(String),
     UserLoggedIn { name: String },
     UserLoggedOut { name: String },
-    UserMessage { name: String, message: String }
+    UserMessage { name: String, message: String },
+    UserCommand { command: String, args: Vec<String> },
+    PrivateMessage { party: String, message: String, is_to: bool },
 }
 
 fn client_handle<S>(_stream: S, output: UnboundedSender<String>,
@@ -199,6 +248,49 @@ fn client_handle<S>(_stream: S, output: UnboundedSender<String>,
     }).map_err(|(err, _)| err)
 }
 
+fn parse_command(string: &str) -> Option<(String, Vec<String>)> {
+    if string.is_empty() || string.chars().next() != Some('/') {
+        return None;
+    }
+
+    let mut buffer = String::new();
+    let mut command: Option<String> = None;
+    let mut args = Vec::new();
+    let mut reading_chars = false;
+    fn push_cmd(_command: &mut Option<String>, _args: &mut Vec<String>, _buffer: String) {
+        if _command.is_none() {
+            *_command = Some(_buffer);
+        } else {
+            _args.push(_buffer);
+        }
+    }
+    for c in string.chars().skip(1) {
+        if reading_chars {
+            if c.is_whitespace() {
+                push_cmd(&mut command, &mut args, buffer);
+                reading_chars = false;
+                buffer = String::new();
+            } else {
+                buffer.push(c);
+            }
+        } else {
+            if !c.is_whitespace() {
+                buffer.push(c);
+                reading_chars = true;
+            }
+        }
+    }
+    push_cmd(&mut command, &mut args, buffer);
+    command.map(move |cmd| (cmd, args))
+}
+
+#[test]
+fn commands_parse() {
+    assert!(parse_command("/noargs") == Some(("noargs".to_owned(), Vec::<String>::new())));
+    assert!(parse_command("/foo bar baz") == Some(("foo".to_owned(),
+                                                   vec!["bar".to_owned(), "baz".to_owned()])));
+}
+
 fn transition(state: ClientState, msg: Message, main_channel: UnboundedSender<Message>,
               output: UnboundedSender<String>) -> Option<ClientState> {
     match (&state, &msg) {
@@ -206,16 +298,32 @@ fn transition(state: ClientState, msg: Message, main_channel: UnboundedSender<Me
             main_channel.unbounded_send(Message::UserLoggedIn { name: name.to_owned() }).unwrap();
             Some(ClientState::LoggedIn { name: name.to_owned() })
         },
-        (ClientState::LoggedIn { name }, Message::ClientInput(message)) => {
-            let msg = Message::UserMessage {
-                name: name.to_owned(),
-                message: message.to_owned()
+        (ClientState::LoggedIn { name }, Message::ClientInput(string)) => {
+            let msg = if let Some((cmd, args)) = parse_command(string) {
+                Message::UserCommand {
+                    command: cmd,
+                    args: args
+                }
+            } else {
+                Message::UserMessage {
+                    name: name.to_owned(),
+                    message: string.to_owned()
+                }
             };
             main_channel.unbounded_send(msg).unwrap();
             Some(state)
         },
         (ClientState::LoggedIn { .. }, Message::UserMessage { name, message }) => {
             output.unbounded_send(format!("{}: {}", name, message)).unwrap();
+            Some(state)
+        },
+        (ClientState::LoggedIn { .. }, Message::PrivateMessage { party, message, is_to }) => {
+            let msg = if *is_to {
+                format!(">> {}: {}", party, message)
+            } else {
+                format!("<< {}: {}", party, message)
+            };
+            output.unbounded_send(msg).unwrap();
             Some(state)
         },
         (ClientState::LoggedIn { .. }, Message::UserLoggedIn { name: user }) => {
