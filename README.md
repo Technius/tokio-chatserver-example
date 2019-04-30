@@ -27,7 +27,7 @@ It's also possible to send a "private message" to user `<name>` by typing in
 
 ## License
 
-Copyright 2018 Bryan Tan ("Technius")
+Copyright 2019 Bryan Tan ("Technius")
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
